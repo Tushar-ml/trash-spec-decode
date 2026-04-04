@@ -7,7 +7,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from models.tree_attention import build_tree_attention_mask_4d
+from models.tree_attention import (
+    build_tree_attention_mask_4d,
+    build_tree_attention_mask_4d_with_past,
+)
 from models.token_recycling import TokenRecycling
 from models.tree import DraftTree, TreeConfig, tree_to_merged
 
@@ -60,6 +63,20 @@ def test_mask_seq_len_matches_paper_layout():
     T = 3
     mask = build_tree_attention_mask_4d(T, parents, torch.float32, torch.device("cpu"))
     assert mask.shape[-1] == T + parents.shape[0] - 1
+
+
+def test_past_mask_matches_full_draft_rows():
+    parents = torch.tensor([-1, 0, 0], dtype=torch.long)
+    T, dtype, dev = 5, torch.float32, torch.device("cpu")
+    full_m = build_tree_attention_mask_4d(T, parents, dtype, dev)[0, 0]
+    past_m = build_tree_attention_mask_4d_with_past(T, parents, dtype, dev)[0, 0]
+    draft_len = parents.shape[0] - 1
+    for i in range(draft_len):
+        q_full = T + i
+        assert torch.allclose(
+            full_m[q_full, : T + i + 1],
+            past_m[i, : T + i + 1],
+        )
 
 
 def test_draft_tree_chain_matches_merge():

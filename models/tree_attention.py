@@ -65,6 +65,40 @@ def build_tree_attention_mask_4d(
     return mask
 
 
+def build_tree_attention_mask_4d_with_past(
+    prefix_len: int,
+    parents_merged: torch.LongTensor,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Tree mask for an incremental forward: queries = draft tokens only (len = L-1),
+    keys = prefix (len prefix_len) + draft (len L-1).
+
+    Shape (1, 1, draft_len, prefix_len + draft_len). Use with
+    model(draft_ids, past_key_values=prefill_cache, attention_mask=this).
+    """
+    parents_list = parents_merged.tolist()
+    L = len(parents_list)
+    draft_len = L - 1
+    if draft_len <= 0:
+        raise ValueError("parents_merged must have length >= 2")
+    kv_len = prefix_len + draft_len
+    min_dtype = torch.finfo(dtype).min
+    mask = torch.full((1, 1, draft_len, kv_len), min_dtype, device=device, dtype=dtype)
+
+    for i in range(draft_len):
+        merged_q = i + 1
+        anc = _ancestor_set(parents_list, merged_q)
+        mask[0, 0, i, :prefix_len] = 0.0
+        for j_local in range(i + 1):
+            mk = j_local + 1
+            if mk in anc:
+                mask[0, 0, i, prefix_len + j_local] = 0.0
+
+    return mask
+
+
 def build_ancestor_table(parents_merged: list[int] | torch.LongTensor) -> list[set[int]]:
     if isinstance(parents_merged, torch.Tensor):
         parents_merged = parents_merged.tolist()

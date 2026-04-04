@@ -11,7 +11,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from .modeling_llama import LlamaForCausalLM
 from .tree import DraftTree, TreeConfig, build_children_from_parents, tree_to_merged
-from .tree_attention import build_tree_attention_mask_4d
+from .tree_attention import build_tree_attention_mask_4d_with_past
 
 
 class TokenRecycling:
@@ -26,8 +26,9 @@ class TokenRecycling:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = LlamaForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-            attn_implementation="eager",
+            dtype=torch.float16 if self.device == "cuda" else torch.float32,
+            # SDPA is much faster than eager; tree mask still uses the sdpa path with attn_mask set
+            attn_implementation="sdpa" if self.device == "cuda" else "eager",
         ).to(self.device)
         self.model.eval()
 
@@ -77,10 +78,19 @@ class TokenRecycling:
             prompt, return_tensors="pt", add_special_tokens=False
         ).input_ids.to(self.device)
         m = self._matrix_on_device()
+        past_key_values = None
 
         with torch.no_grad():
             for _ in tqdm(range(max_length), leave=False):
-                outputs = self.model(tokens, use_cache=False)
+                if past_key_values is None:
+                    outputs = self.model(tokens, use_cache=True)
+                else:
+                    outputs = self.model(
+                        tokens[:, -1:],
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                past_key_values = outputs.past_key_values
                 current_token = tokens[:, -1].squeeze(-1)
                 logits = outputs.logits[:, -1, :]
                 top_k_indices = torch.topk(logits, k=self.k, dim=-1).indices
@@ -107,7 +117,6 @@ class TokenRecycling:
         """
         batch, T = input_ids.shape
         assert batch == 1
-        dtype = self.model.dtype
         device = self.device
 
         root_id = int(input_ids[0, -1].item())
@@ -123,36 +132,48 @@ class TokenRecycling:
 
         if L <= 1:
             with torch.no_grad():
-                out = self.model(input_ids, use_cache=False)
-            logits = out.logits
-            last = logits[:, -1, :]
+                out = self.model(input_ids, use_cache=True)
+            last = out.logits[:, -1, :]
             next_id = last.argmax(dim=-1, keepdim=True)
             tid = torch.tensor([root_id], device="cpu", dtype=torch.long)
             self._update_matrix_from_logits(last[0].cpu(), tid)
             return next_id, 1
 
         draft = merged.token_ids[1:].to(device).unsqueeze(0)
-        full_ids = torch.cat([input_ids, draft], dim=-1)
-        attn = build_tree_attention_mask_4d(
-            T, merged.parents.to(device), dtype=dtype, device=device
+        parents_dev = merged.parents.to(device)
+        mask_dtype = torch.float32
+        attn = build_tree_attention_mask_4d_with_past(
+            T, parents_dev, dtype=mask_dtype, device=device
         )
 
         with torch.no_grad():
-            out = self.model(full_ids, attention_mask=attn, use_cache=False)
-        logits = out.logits
+            ctx_out = self.model(input_ids, use_cache=True)
+            logits_ctx = ctx_out.logits[:, -1, :]
+            draft_out = self.model(
+                draft,
+                past_key_values=ctx_out.past_key_values,
+                attention_mask=attn,
+                use_cache=False,
+            )
+            logits_draft = draft_out.logits
+
         parents_cpu = merged.parents
         tok_cpu = merged.token_ids.cpu()
-        logits_cpu = logits[0].float().cpu()
-        pos = torch.arange(T - 1, T - 1 + L)
-        _, topk_idx = torch.topk(logits_cpu[pos], k=self.k, dim=-1)
-        self.adjacency_matrix[tok_cpu] = topk_idx.cpu().long()
+        logits_ctx_cpu = logits_ctx[0].float().cpu()
+        logits_draft_cpu = logits_draft[0].float().cpu()
+
+        logits_rows = torch.cat(
+            [logits_ctx_cpu.unsqueeze(0), logits_draft_cpu], dim=0
+        )
+        _, topk_idx = torch.topk(logits_rows, k=self.k, dim=-1)
+        self.adjacency_matrix[tok_cpu] = topk_idx.long()
 
         children = build_children_from_parents(parents_cpu)
         cur = 0
         accepted: List[int] = []
         while True:
-            pos = T - 1 + cur
-            pred = int(logits_cpu[pos].argmax().item())
+            row = logits_ctx_cpu if cur == 0 else logits_draft_cpu[cur - 1]
+            pred = int(row.argmax().item())
             nxt = None
             for ch in children[cur]:
                 if int(tok_cpu[ch].item()) == pred:
@@ -164,7 +185,7 @@ class TokenRecycling:
             cur = nxt
 
         if not accepted:
-            nxt_id = int(logits_cpu[T - 1].argmax().item())
+            nxt_id = int(logits_ctx_cpu.argmax().item())
             return torch.tensor([[nxt_id]], device=device, dtype=torch.long), 1
 
         return (
@@ -197,14 +218,25 @@ class TokenRecycling:
         max_new_tokens: int = 256,
         eos_token_id: Optional[int] = None,
     ) -> torch.LongTensor:
-        """Baseline autoregressive greedy (no draft tree)."""
+        """Greedy autoregressive baseline: one new token per step with KV cache."""
         if eos_token_id is None:
             eos_token_id = self.tokenizer.eos_token_id
         out = input_ids.to(self.device)
+        past_key_values = None
+        nxt: Optional[torch.LongTensor] = None
         for _ in range(max_new_tokens):
             with torch.no_grad():
-                logits = self.model(out, use_cache=False).logits[:, -1, :]
-            nxt = logits.argmax(dim=-1, keepdim=True)
+                if past_key_values is None:
+                    outputs = self.model(out, use_cache=True)
+                else:
+                    outputs = self.model(
+                        nxt,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                past_key_values = outputs.past_key_values
+                logits = outputs.logits[:, -1, :]
+                nxt = logits.argmax(dim=-1, keepdim=True)
             out = torch.cat([out, nxt], dim=-1)
             if eos_token_id is not None and nxt.item() == eos_token_id:
                 break

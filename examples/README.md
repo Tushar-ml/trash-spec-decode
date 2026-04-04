@@ -12,6 +12,13 @@ pip install -r requirements.txt
 
 Use a GPU for meaningful throughput numbers.
 
+## Interpreting speedup
+
+- **AR baseline** uses **incremental decoding with KV cache** (one new token per step).
+- **Token Recycling (draft)** matches the paper’s pattern: **prefill the context with KV cache**, then a **second forward only over draft tokens** with a **tree attention mask** (no full-length `(context + draft)` matmul). The model uses **SDPA** on CUDA for attention. Remaining gap vs published numbers can come from hardware, `torch.compile`, FlashAttention-2 (custom tree kernels), and hot-started matrices.
+
+The `speedup (AR_time / draft_time)` line is **> 1** when draft wall-clock beats AR for the same run settings.
+
 ## Benchmark: Token Recycling (draft) vs greedy AR
 
 [`benchmark_decode.py`](benchmark_decode.py) times both decoders on the same prompt and reports tokens/s plus a wall-clock ratio.
