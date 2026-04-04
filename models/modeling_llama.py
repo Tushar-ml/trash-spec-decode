@@ -574,6 +574,13 @@ LLAMA_ATTENTION_CLASSES = {
     "sdpa": LlamaSdpaAttention,
 }
 
+try:
+    from .flashinfer_attention import LlamaFlashInferAttention
+
+    LLAMA_ATTENTION_CLASSES["flash_infer"] = LlamaFlashInferAttention
+except ImportError:
+    pass
+
 
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):

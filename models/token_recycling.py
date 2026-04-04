@@ -12,6 +12,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.cache_utils import Cache, DynamicCache
 
 from .modeling_llama import LlamaForCausalLM
+from .flashinfer_attention import apply_flash_infer_attention
 from .tree import DraftTree, TreeConfig, build_children_from_parents, tree_to_merged
 from .tree_attention import build_tree_attention_mask_4d_with_past
 
@@ -54,6 +55,22 @@ def _quiet_torch_inductor_logs(level: int = logging.WARNING) -> None:
         logging.getLogger(name).setLevel(level)
 
 
+def _disable_inductor_cudagraphs_for_kv_cache() -> None:
+    """
+    DynamicCache mutates KV tensors in-place across steps. Inductor CUDA graph capture
+    assumes prior graph outputs are not overwritten; that combination raises at runtime
+    even with torch.compiler.cudagraph_mark_step_begin(). Disable graph capture; compile
+    still applies kernel fusion without CUDAGraph wrapping.
+    """
+    try:
+        import torch._inductor.config as inductor_config
+
+        inductor_config.triton.cudagraphs = False
+        inductor_config.triton.cudagraph_trees = False
+    except Exception:
+        pass
+
+
 class TokenRecycling:
     def __init__(
         self,
@@ -65,24 +82,63 @@ class TokenRecycling:
         compile_mode: str = "reduce-overhead",
         cuda_tf32: bool = True,
         quiet_inductor_logs: bool = True,
+        attn_implementation: str = "sdpa",
     ) -> None:
         logger.info(f"Loading {model_id}")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         if self.device == "cuda" and cuda_tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+
+        use_flash_infer = False
+        if attn_implementation == "flash_infer":
+            if self.device != "cuda":
+                logger.warning(
+                    "attn_implementation=flash_infer requires CUDA; falling back to sdpa"
+                )
+                attn_implementation = "sdpa"
+            else:
+                try:
+                    import flashinfer  # noqa: F401
+
+                    use_flash_infer = True
+                except ImportError:
+                    logger.warning(
+                        "flash_infer requested but flashinfer is not installed "
+                        "(pip install -r requirements-optional.txt); falling back to sdpa"
+                    )
+                    attn_implementation = "sdpa"
+
+        load_attn = (
+            attn_implementation
+            if self.device == "cuda"
+            else ("eager" if attn_implementation == "eager" else "sdpa")
+        )
+        if use_flash_infer:
+            load_attn = "sdpa"
+
+        if use_flash_infer and compile_model:
+            logger.warning(
+                "Disabling torch.compile when using FlashInfer attention (use SDPA + compile for that path)"
+            )
+            compile_model = False
+
         self.model = LlamaForCausalLM.from_pretrained(
             model_id,
             dtype=torch.float16 if self.device == "cuda" else torch.float32,
-            # SDPA is much faster than eager; tree mask still uses the sdpa path with attn_mask set
-            attn_implementation="sdpa" if self.device == "cuda" else "eager",
+            attn_implementation=load_attn,
         ).to(self.device)
+        if use_flash_infer:
+            apply_flash_infer_attention(self.model)
+            logger.info("FlashInfer attention kernels enabled (single_decode / single_prefill_with_kv_cache)")
         self.model.eval()
         self._compiled_cuda = False
+        self.attn_implementation = "flash_infer" if use_flash_infer else load_attn
 
         if compile_model and self.device == "cuda":
             if quiet_inductor_logs:
                 _quiet_torch_inductor_logs()
+            _disable_inductor_cudagraphs_for_kv_cache()
             try:
                 self.model = torch.compile(
                     self.model,
@@ -92,7 +148,8 @@ class TokenRecycling:
                 )
                 self._compiled_cuda = True
                 logger.info(
-                    f"torch.compile enabled (mode={compile_mode}, dynamic=True)"
+                    f"torch.compile enabled (mode={compile_mode}, dynamic=True; "
+                    "Inductor CUDAGraphs off for HF KV cache)"
                 )
             except Exception as exc:
                 logger.warning(f"torch.compile skipped: {exc}")

@@ -1,0 +1,4 @@
+# Optional: FlashInfer-backed Llama attention (CUDA only).
+# Install: pip install -r requirements-optional.txt
+# Requires CUDA-capable GPU and a compatible PyTorch build.
+flashinfer-python>=0.2.0

@@ -67,6 +67,7 @@ def run_benchmark(
     compile_mode: str,
     cuda_tf32: bool,
     quiet_inductor_logs: bool,
+    attn_implementation: str,
 ) -> None:
     tree_config = TreeConfig(
         max_depth=tree_max_depth,
@@ -82,6 +83,7 @@ def run_benchmark(
         compile_mode=compile_mode,
         cuda_tf32=cuda_tf32,
         quiet_inductor_logs=quiet_inductor_logs,
+        attn_implementation=attn_implementation,
     )
     eos = tr.tokenizer.eos_token_id
     prompt_len = input_ids.shape[1]
@@ -177,6 +179,12 @@ def main() -> None:
         action="store_true",
         help="Show torch.compile / Inductor INFO (AUTOTUNE, cudagraph partition lines)",
     )
+    p.add_argument(
+        "--attn",
+        choices=("sdpa", "flash_infer"),
+        default="sdpa",
+        help="Attention backend: sdpa (default) or flash_infer (CUDA + pip install -r requirements-optional.txt)",
+    )
     args = p.parse_args()
 
     if args.prompt_file:
@@ -205,6 +213,7 @@ def main() -> None:
         compile_mode=args.compile_mode,
         cuda_tf32=not args.no_tf32,
         quiet_inductor_logs=not args.verbose_inductor,
+        attn_implementation=args.attn,
     )
 
 

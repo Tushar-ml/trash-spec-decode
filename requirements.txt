@@ -2,3 +2,4 @@ torch>=2.1.0
 transformers==4.57.0
 tqdm
 loguru
+# Optional CUDA attention kernels: pip install -r requirements-optional.txt
