@@ -23,9 +23,14 @@ class TokenRecycling:
         trash_file: Optional[str] = None,
         tree_config: Optional[TreeConfig] = None,
         compile_model: bool = True,
+        compile_mode: str = "reduce-overhead",
+        cuda_tf32: bool = True,
     ) -> None:
         logger.info(f"Loading {model_id}")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if self.device == "cuda" and cuda_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         self.model = LlamaForCausalLM.from_pretrained(
             model_id,
             dtype=torch.float16 if self.device == "cuda" else torch.float32,
@@ -38,11 +43,13 @@ class TokenRecycling:
             try:
                 self.model = torch.compile(
                     self.model,
-                    mode="reduce-overhead",
+                    mode=compile_mode,
                     dynamic=True,
                     fullgraph=False,
                 )
-                logger.info("torch.compile enabled (mode=reduce-overhead, dynamic=True)")
+                logger.info(
+                    f"torch.compile enabled (mode={compile_mode}, dynamic=True)"
+                )
             except Exception as exc:
                 logger.warning(f"torch.compile skipped: {exc}")
 
@@ -286,16 +293,21 @@ class TokenRecycling:
         if eos_token_id is None:
             eos_token_id = self.tokenizer.eos_token_id
         out = input_ids.to(self.device)
-        past_key_values = None
+        past_key_values: Optional[Cache] = None
         nxt: Optional[torch.LongTensor] = None
         for _ in range(max_new_tokens):
             with torch.inference_mode():
-                if past_key_values is None:
+                pk_in = (
+                    self._as_cache(past_key_values)
+                    if past_key_values is not None
+                    else None
+                )
+                if pk_in is None:
                     outputs = self.model(out, use_cache=True)
                 else:
                     outputs = self.model(
                         nxt,
-                        past_key_values=past_key_values,
+                        past_key_values=pk_in,
                         use_cache=True,
                     )
                 past_key_values = self._as_cache(outputs.past_key_values)
