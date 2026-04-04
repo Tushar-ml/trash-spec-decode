@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import List, Optional, Tuple
 
@@ -15,6 +16,44 @@ from .tree import DraftTree, TreeConfig, build_children_from_parents, tree_to_me
 from .tree_attention import build_tree_attention_mask_4d_with_past
 
 
+def _quiet_torch_inductor_logs(level: int = logging.WARNING) -> None:
+    """
+    Lower Inductor / compile INFO noise (AUTOTUNE timings, cudagraph partition hints).
+
+    Those messages are expected with torch.compile + dynamic shapes: the compiler
+    tries CUDA graphs, then splits when it hits CPU or DeviceCopy ops. Harmless.
+    """
+    try:
+        import torch._logging as torch_logging
+
+        try:
+            torch_logging.set_logs(
+                inductor=level,
+                dynamo=level,
+                benchmarking=False,
+                autotuning=False,
+                cudagraphs=False,
+                graph_region_expansion=False,
+            )
+        except TypeError:
+            torch_logging.set_logs(inductor=level, dynamo=level)
+    except Exception:
+        pass
+    for name in list(logging.root.manager.loggerDict.keys()):
+        s = str(name)
+        if s.startswith("torch._inductor") or s.startswith("torch._dynamo"):
+            logging.getLogger(s).setLevel(level)
+    for name in (
+        "torch._inductor",
+        "torch._inductor.compile_fx",
+        "torch._inductor.select_algorithm",
+        "torch._inductor.cudagraph_trees",
+        "torch._dynamo",
+        "torch.fx.experimental.symbolic_shapes",
+    ):
+        logging.getLogger(name).setLevel(level)
+
+
 class TokenRecycling:
     def __init__(
         self,
@@ -25,6 +64,7 @@ class TokenRecycling:
         compile_model: bool = True,
         compile_mode: str = "reduce-overhead",
         cuda_tf32: bool = True,
+        quiet_inductor_logs: bool = True,
     ) -> None:
         logger.info(f"Loading {model_id}")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -38,8 +78,11 @@ class TokenRecycling:
             attn_implementation="sdpa" if self.device == "cuda" else "eager",
         ).to(self.device)
         self.model.eval()
+        self._compiled_cuda = False
 
         if compile_model and self.device == "cuda":
+            if quiet_inductor_logs:
+                _quiet_torch_inductor_logs()
             try:
                 self.model = torch.compile(
                     self.model,
@@ -47,6 +90,7 @@ class TokenRecycling:
                     dynamic=True,
                     fullgraph=False,
                 )
+                self._compiled_cuda = True
                 logger.info(
                     f"torch.compile enabled (mode={compile_mode}, dynamic=True)"
                 )
@@ -80,21 +124,34 @@ class TokenRecycling:
             return past_key_values
         return DynamicCache.from_legacy_cache(past_key_values)
 
+    def _call_model(self, *args, **kwargs):
+        """
+        Inductor may wrap forwards in CUDA graphs; DynamicCache updates tensors in-place.
+        Mark each step so graph outputs are not reused after KV cache overwrites them.
+        See: torch.compiler.cudagraph_mark_step_begin
+        """
+        if getattr(self, "_compiled_cuda", False):
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except Exception:
+                pass
+        return self.model(*args, **kwargs)
+
     def _forward_ctx(self, input_ids: torch.LongTensor, past_kv: Optional[Cache]) -> object:
         """KV cache after processing all tokens in input_ids (length T). One token at a time after prefill."""
         batch, t = input_ids.shape
         assert batch == 1
         with torch.inference_mode():
             if past_kv is None:
-                return self.model(input_ids, use_cache=True)
+                return self._call_model(input_ids, use_cache=True)
             sl = past_kv.get_seq_length()
             if sl == t - 1:
-                return self.model(
+                return self._call_model(
                     input_ids[:, -1:],
                     past_key_values=past_kv,
                     use_cache=True,
                 )
-            return self.model(input_ids, use_cache=True)
+            return self._call_model(input_ids, use_cache=True)
 
     def _past_for_next_step(
         self, ctx_past: Cache, accepted: torch.LongTensor
@@ -111,7 +168,7 @@ class TokenRecycling:
         if n == 1:
             return ctx_past
         with torch.inference_mode():
-            out = self.model(
+            out = self._call_model(
                 accepted[:, :-1],
                 past_key_values=ctx_past,
                 use_cache=True,
@@ -148,9 +205,9 @@ class TokenRecycling:
         with torch.inference_mode():
             for _ in tqdm(range(max_length), leave=False):
                 if past_key_values is None:
-                    outputs = self.model(tokens, use_cache=True)
+                    outputs = self._call_model(tokens, use_cache=True)
                 else:
-                    outputs = self.model(
+                    outputs = self._call_model(
                         tokens[:, -1:],
                         past_key_values=past_key_values,
                         use_cache=True,
@@ -218,7 +275,7 @@ class TokenRecycling:
 
         with torch.inference_mode():
             logits_ctx = ctx_out.logits[:, -1, :]
-            draft_out = self.model(
+            draft_out = self._call_model(
                 draft,
                 past_key_values=ctx_past,
                 attention_mask=attn,
@@ -303,9 +360,9 @@ class TokenRecycling:
                     else None
                 )
                 if pk_in is None:
-                    outputs = self.model(out, use_cache=True)
+                    outputs = self._call_model(out, use_cache=True)
                 else:
-                    outputs = self.model(
+                    outputs = self._call_model(
                         nxt,
                         past_key_values=pk_in,
                         use_cache=True,

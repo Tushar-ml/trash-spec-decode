@@ -66,6 +66,7 @@ def run_benchmark(
     compile_model: bool,
     compile_mode: str,
     cuda_tf32: bool,
+    quiet_inductor_logs: bool,
 ) -> None:
     tree_config = TreeConfig(
         max_depth=tree_max_depth,
@@ -80,6 +81,7 @@ def run_benchmark(
         compile_model=compile_model,
         compile_mode=compile_mode,
         cuda_tf32=cuda_tf32,
+        quiet_inductor_logs=quiet_inductor_logs,
     )
     eos = tr.tokenizer.eos_token_id
     prompt_len = input_ids.shape[1]
@@ -170,6 +172,11 @@ def main() -> None:
         action="store_true",
         help="Do not allow TF32 for matmul/cudnn on CUDA (default: TF32 on for throughput)",
     )
+    p.add_argument(
+        "--verbose-inductor",
+        action="store_true",
+        help="Show torch.compile / Inductor INFO (AUTOTUNE, cudagraph partition lines)",
+    )
     args = p.parse_args()
 
     if args.prompt_file:
@@ -197,6 +204,7 @@ def main() -> None:
         compile_model=not args.no_compile,
         compile_mode=args.compile_mode,
         cuda_tf32=not args.no_tf32,
+        quiet_inductor_logs=not args.verbose_inductor,
     )
 
 
