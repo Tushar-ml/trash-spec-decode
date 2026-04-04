@@ -8,9 +8,11 @@ import torch
 
 @dataclass
 class TreeConfig:
-    max_depth: int = 6
-    max_breadth: int = 80
-    max_nodes: int = 80
+    # Paper uses depth 6 / ~80 nodes; smaller defaults cut draft-verify cost per step.
+    # Raise toward paper values when the matrix is hot and acceptance is high.
+    max_depth: int = 5
+    max_breadth: int = 40
+    max_nodes: int = 40
 
     def __post_init__(self) -> None:
         if self.max_breadth > self.max_nodes:

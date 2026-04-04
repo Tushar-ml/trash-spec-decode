@@ -15,9 +15,15 @@ Use a GPU for meaningful throughput numbers.
 ## Interpreting speedup
 
 - **AR baseline** uses **incremental decoding with KV cache** (one new token per step).
-- **Token Recycling (draft)** matches the paper’s pattern: **prefill the context with KV cache**, then a **second forward only over draft tokens** with a **tree attention mask** (no full-length `(context + draft)` matmul). The model uses **SDPA** on CUDA for attention. Remaining gap vs published numbers can come from hardware, `torch.compile`, FlashAttention-2 (custom tree kernels), and hot-started matrices.
+- **Token Recycling (draft)** matches the paper’s pattern: **prefill the context with KV cache**, then a **second forward only over draft tokens** with a **tree attention mask**. Across speculative steps it **reuses KV** the same way as AR: after the first prompt prefill, each step only runs **`model(last_token, past)`** for the context branch (not a full re-forward over the whole history). Remaining gap vs published numbers can come from hardware, `torch.compile`, FlashAttention-2 (custom tree kernels), and hot-started matrices.
 
 The `speedup (AR_time / draft_time)` line is **> 1** when draft wall-clock beats AR for the same run settings.
+
+**Why draft can still look slower than AR**
+
+- Each speculative step runs **one** cached context forward plus a **tree-shaped** forward over many draft positions; AR runs **one** token forward. Unless the **mean accepted length** (MAT) per step is well above 1, the extra tree work may not pay for itself.
+- Defaults use a **smaller tree** (40 nodes / depth 5) than the paper’s 80 / 6 for faster verification; raise `--tree-max-nodes` etc. when using a **hot** `--matrix`.
+- **`torch.compile`** is enabled on CUDA by default; use `--no-compile` if you hit issues. Increase **`--warmup`** so compile + CUDA graphs settle before timing.
 
 ## Benchmark: Token Recycling (draft) vs greedy AR
 

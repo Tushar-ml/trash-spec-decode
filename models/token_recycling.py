@@ -8,6 +8,7 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
+from transformers.cache_utils import Cache, DynamicCache
 
 from .modeling_llama import LlamaForCausalLM
 from .tree import DraftTree, TreeConfig, build_children_from_parents, tree_to_merged
@@ -21,6 +22,7 @@ class TokenRecycling:
         k: int = 8,
         trash_file: Optional[str] = None,
         tree_config: Optional[TreeConfig] = None,
+        compile_model: bool = True,
     ) -> None:
         logger.info(f"Loading {model_id}")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,6 +33,18 @@ class TokenRecycling:
             attn_implementation="sdpa" if self.device == "cuda" else "eager",
         ).to(self.device)
         self.model.eval()
+
+        if compile_model and self.device == "cuda":
+            try:
+                self.model = torch.compile(
+                    self.model,
+                    mode="reduce-overhead",
+                    dynamic=True,
+                    fullgraph=False,
+                )
+                logger.info("torch.compile enabled (mode=reduce-overhead, dynamic=True)")
+            except Exception as exc:
+                logger.warning(f"torch.compile skipped: {exc}")
 
         self.config = AutoConfig.from_pretrained(model_id)
         self.vocab_size = self.config.vocab_size
@@ -52,6 +66,50 @@ class TokenRecycling:
 
     def _matrix_on_device(self) -> torch.Tensor:
         return self.adjacency_matrix.to(self.device)
+
+    @staticmethod
+    def _as_cache(past_key_values: object) -> Cache:
+        if isinstance(past_key_values, Cache):
+            return past_key_values
+        return DynamicCache.from_legacy_cache(past_key_values)
+
+    def _forward_ctx(self, input_ids: torch.LongTensor, past_kv: Optional[Cache]) -> object:
+        """KV cache after processing all tokens in input_ids (length T). One token at a time after prefill."""
+        batch, t = input_ids.shape
+        assert batch == 1
+        with torch.inference_mode():
+            if past_kv is None:
+                return self.model(input_ids, use_cache=True)
+            sl = past_kv.get_seq_length()
+            if sl == t - 1:
+                return self.model(
+                    input_ids[:, -1:],
+                    past_key_values=past_kv,
+                    use_cache=True,
+                )
+            return self.model(input_ids, use_cache=True)
+
+    def _past_for_next_step(
+        self, ctx_past: Cache, accepted: torch.LongTensor
+    ) -> Cache:
+        """
+        After a speculative step, build KV for the next step's invariant:
+        next forward only needs past covering new sequence[:-1].
+
+        ctx_past: cache after full current prefix (length T).
+        accepted: (1, n) newly appended tokens, n >= 1.
+        Returns cache with length T + n - 1.
+        """
+        n = accepted.shape[1]
+        if n == 1:
+            return ctx_past
+        with torch.inference_mode():
+            out = self.model(
+                accepted[:, :-1],
+                past_key_values=ctx_past,
+                use_cache=True,
+            )
+        return self._as_cache(out.past_key_values)
 
     def generate_matrix_using_dataset(
         self,
@@ -80,7 +138,7 @@ class TokenRecycling:
         m = self._matrix_on_device()
         past_key_values = None
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in tqdm(range(max_length), leave=False):
                 if past_key_values is None:
                     outputs = self.model(tokens, use_cache=True)
@@ -90,7 +148,7 @@ class TokenRecycling:
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
-                past_key_values = outputs.past_key_values
+                past_key_values = self._as_cache(outputs.past_key_values)
                 current_token = tokens[:, -1].squeeze(-1)
                 logits = outputs.logits[:, -1, :]
                 top_k_indices = torch.topk(logits, k=self.k, dim=-1).indices
@@ -110,10 +168,14 @@ class TokenRecycling:
         m[token_ids.long()] = topk_idx.cpu().long()
 
     def _speculative_step(
-        self, input_ids: torch.LongTensor
-    ) -> Tuple[torch.LongTensor, int]:
+        self,
+        input_ids: torch.LongTensor,
+        past_kv: Optional[Cache],
+    ) -> Tuple[torch.LongTensor, int, Cache]:
         """
-        One Token Recycling step. Returns (new_token_chunk, num_tokens_appended).
+        One Token Recycling step. Returns (new_token_chunk, num_tokens_appended, past_for_next_step).
+
+        past_kv: KV after processing input_ids[:-1], or None (full prefill on first step).
         """
         batch, T = input_ids.shape
         assert batch == 1
@@ -130,28 +192,28 @@ class TokenRecycling:
         merged = tree_to_merged(root_node)
         L = merged.token_ids.shape[0]
 
+        ctx_out = self._forward_ctx(input_ids, past_kv)
+        ctx_past = self._as_cache(ctx_out.past_key_values)
+
         if L <= 1:
-            with torch.no_grad():
-                out = self.model(input_ids, use_cache=True)
-            last = out.logits[:, -1, :]
+            last = ctx_out.logits[:, -1, :]
             next_id = last.argmax(dim=-1, keepdim=True)
             tid = torch.tensor([root_id], device="cpu", dtype=torch.long)
             self._update_matrix_from_logits(last[0].cpu(), tid)
-            return next_id, 1
+            next_past = self._past_for_next_step(ctx_past, next_id)
+            return next_id, 1, next_past
 
         draft = merged.token_ids[1:].to(device).unsqueeze(0)
         parents_dev = merged.parents.to(device)
-        mask_dtype = torch.float32
         attn = build_tree_attention_mask_4d_with_past(
-            T, parents_dev, dtype=mask_dtype, device=device
+            T, parents_dev, dtype=self.model.dtype, device=device
         )
 
-        with torch.no_grad():
-            ctx_out = self.model(input_ids, use_cache=True)
+        with torch.inference_mode():
             logits_ctx = ctx_out.logits[:, -1, :]
             draft_out = self.model(
                 draft,
-                past_key_values=ctx_out.past_key_values,
+                past_key_values=ctx_past,
                 attention_mask=attn,
                 use_cache=False,
             )
@@ -186,12 +248,13 @@ class TokenRecycling:
 
         if not accepted:
             nxt_id = int(logits_ctx_cpu.argmax().item())
-            return torch.tensor([[nxt_id]], device=device, dtype=torch.long), 1
+            single = torch.tensor([[nxt_id]], device=device, dtype=torch.long)
+            next_past = self._past_for_next_step(ctx_past, single)
+            return single, 1, next_past
 
-        return (
-            torch.tensor([accepted], device=device, dtype=torch.long),
-            len(accepted),
-        )
+        new_toks = torch.tensor([accepted], device=device, dtype=torch.long)
+        next_past = self._past_for_next_step(ctx_past, new_toks)
+        return new_toks, len(accepted), next_past
 
     def generate(
         self,
@@ -203,9 +266,10 @@ class TokenRecycling:
             eos_token_id = self.tokenizer.eos_token_id
 
         out = input_ids.to(self.device)
+        past_kv: Optional[Cache] = None
         generated = 0
         while generated < max_new_tokens:
-            new_toks, n = self._speculative_step(out)
+            new_toks, n, past_kv = self._speculative_step(out, past_kv)
             out = torch.cat([out, new_toks], dim=-1)
             generated += n
             if eos_token_id is not None and (new_toks == eos_token_id).any():
@@ -225,7 +289,7 @@ class TokenRecycling:
         past_key_values = None
         nxt: Optional[torch.LongTensor] = None
         for _ in range(max_new_tokens):
-            with torch.no_grad():
+            with torch.inference_mode():
                 if past_key_values is None:
                     outputs = self.model(out, use_cache=True)
                 else:
@@ -234,7 +298,7 @@ class TokenRecycling:
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
-                past_key_values = outputs.past_key_values
+                past_key_values = self._as_cache(outputs.past_key_values)
                 logits = outputs.logits[:, -1, :]
                 nxt = logits.argmax(dim=-1, keepdim=True)
             out = torch.cat([out, nxt], dim=-1)

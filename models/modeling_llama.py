@@ -743,14 +743,16 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # kept for BC (non `Cache` `past_key_values` inputs)
+        # kept for BC (non `Cache` `past_key_values` inputs). Convert legacy tuples even when use_cache=False,
+        # because downstream code requires a Cache (e.g. get_seq_length) when past_key_values is provided.
         return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
             return_legacy_cache = True
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        elif past_key_values is not None and not isinstance(past_key_values, Cache):
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            if use_cache:
+                return_legacy_cache = True
                 logger.warning_once(
                     "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
                     "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "

@@ -63,6 +63,7 @@ def run_benchmark(
     tree_max_depth: int,
     tree_max_nodes: int,
     tree_max_breadth: int,
+    compile_model: bool,
 ) -> None:
     tree_config = TreeConfig(
         max_depth=tree_max_depth,
@@ -74,6 +75,7 @@ def run_benchmark(
         k=k,
         trash_file=matrix_path,
         tree_config=tree_config,
+        compile_model=compile_model,
     )
     eos = tr.tokenizer.eos_token_id
     prompt_len = input_ids.shape[1]
@@ -145,9 +147,14 @@ def main() -> None:
         help="UTF-8 file with prompt text (overrides --prompt)",
     )
     p.add_argument("--chat", action="store_true", help="Wrap prompt as a single user turn")
-    p.add_argument("--tree-max-depth", type=int, default=6)
-    p.add_argument("--tree-max-nodes", type=int, default=80)
-    p.add_argument("--tree-max-breadth", type=int, default=80)
+    p.add_argument("--tree-max-depth", type=int, default=5)
+    p.add_argument("--tree-max-nodes", type=int, default=40)
+    p.add_argument("--tree-max-breadth", type=int, default=40)
+    p.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile on CUDA (compile is on by default for throughput)",
+    )
     args = p.parse_args()
 
     if args.prompt_file:
@@ -172,6 +179,7 @@ def main() -> None:
         tree_max_depth=args.tree_max_depth,
         tree_max_nodes=args.tree_max_nodes,
         tree_max_breadth=args.tree_max_breadth,
+        compile_model=not args.no_compile,
     )
 
 
