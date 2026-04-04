@@ -1,8 +1,9 @@
 from transformers import AutoTokenizer, TextStreamer
+
 from models.modeling_llama import LlamaForCausalLM
 
 model_id = "meta-llama/Llama-3.2-1B-Instruct"
-model = LlamaForCausalLM.from_pretrained(model_id)
+model = LlamaForCausalLM.from_pretrained(model_id, attn_implementation="eager")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 prompt = [{"role": "system", "content": "Act as a scientist"},
