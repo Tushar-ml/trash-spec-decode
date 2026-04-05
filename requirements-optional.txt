@@ -2,3 +2,6 @@
 # Install: pip install -r requirements-optional.txt
 # Requires CUDA-capable GPU and a compatible PyTorch build.
 flashinfer-python>=0.2.0
+
+# Optional: build Token Recycling .pt matrices with vLLM (see token_recycling_vllm_utils.py).
+# vllm

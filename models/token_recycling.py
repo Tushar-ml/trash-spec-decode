@@ -238,14 +238,51 @@ class TokenRecycling:
         max_length: int = 512,
         nsamples: int = -1,
         save_matrix_path: Optional[str] = None,
+        strip_assistant: bool = False,
+        regenerate_assistant: bool = False,
+        regenerate_max_new_tokens: int = 512,
+        single_turn: bool = False,
     ) -> None:
+        """
+        Each record is normalized to HF chat messages (ShareGPT supported via
+        ``token_recycling_vllm_utils.normalize_conversation_for_chat_template``).
+
+        ShareGPT assistant text is usually from another model, which hurts matrix
+        quality for *this* model. Use ``strip_assistant=True`` to keep only
+        system/user turns, or ``regenerate_assistant=True`` to replace assistant
+        turns with greedy generations from ``self.model``.
+
+        With ``single_turn=True``, keep only leading system messages and the first
+        user message per record (see ``truncate_messages_to_single_turn``).
+        """
+        if strip_assistant and regenerate_assistant:
+            raise ValueError("Use only one of strip_assistant or regenerate_assistant.")
+        import token_recycling_vllm_utils as trvu
+
         with open(dataset_path, "r") as f:
             conversations = json.load(f)
 
         nsamples = nsamples if nsamples > 0 else len(conversations)
-        for conv in conversations[:nsamples]:
+        for conv in tqdm(
+            conversations[:nsamples],
+            desc="dataset conversations",
+            leave=True,
+        ):
+            messages = trvu.normalize_conversation_for_chat_template(conv)
+            if single_turn:
+                messages = trvu.truncate_messages_to_single_turn(messages)
+            if strip_assistant:
+                messages = trvu.strip_assistant_messages(messages)
+            elif regenerate_assistant:
+                messages = trvu.regenerate_assistant_messages_hf(
+                    messages,
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    device=self.device,
+                    max_new_tokens=regenerate_max_new_tokens,
+                )
             prompt = self.tokenizer.apply_chat_template(
-                conv, add_generation_prompt=True, tokenize=False
+                messages, add_generation_prompt=True, tokenize=False
             )
             self.prefill_matrix(prompt, max_length)
 

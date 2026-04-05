@@ -1,0 +1,332 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index f1fda9a..1308844 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -54,6 +54,7 @@ EagleModelTypes = Literal[
+ ]
+ SpeculativeMethod = Literal[
+     "ngram",
++    "token_recycling",
+     "medusa",
+     "mlp_speculator",
+     "draft_model",
+@@ -126,6 +127,12 @@ class SpeculativeConfig:
+     O(2 * tp_size) per token. Only applies to greedy draft selection in
+     non-tree speculation."""
+ 
++    # Token Recycling (arXiv:2408.08696) — train-free matrix drafting
++    token_recycling_k: int = Field(default=8, ge=1)
++    """Width of stored top-k successors per vocabulary id."""
++    token_recycling_matrix_path: str | None = None
++    """Optional path to a pre-built (vocab_size, k) int/long CPU matrix."""
++
+     # Ngram proposer configuration
+     prompt_lookup_max: int | None = Field(default=None, ge=1)
+     """Maximum size of ngram token window when using Ngram proposer, required
+@@ -368,6 +375,8 @@ class SpeculativeConfig:
+         if self.method is None:
+             if self.model in ("ngram", "[ngram]"):
+                 self.method = "ngram"
++            elif self.model in ("token_recycling", "[token_recycling]"):
++                self.method = "token_recycling"
+             else:
+                 self.method = "draft_model"
+ 
+@@ -393,6 +402,8 @@ class SpeculativeConfig:
+                     self.quantization = self.target_model_config.quantization
+             elif self.method in ("ngram", "[ngram]"):
+                 self.model = "ngram"
++            elif self.method == "token_recycling":
++                self.model = "token_recycling"
+             elif self.method == "ngram_gpu":
+                 self.model = "ngram_gpu"
+             elif self.method == "suffix":
+@@ -407,7 +418,12 @@ class SpeculativeConfig:
+         if self.method in ("ngram", "[ngram]"):
+             self.method = "ngram"
+ 
+-        if self.method in ("ngram", "ngram_gpu"):
++        if self.method == "token_recycling":
++            self.prompt_lookup_max = 0
++            self.prompt_lookup_min = 0
++            self.draft_model_config = self.target_model_config
++            self.draft_parallel_config = self.target_parallel_config
++        elif self.method in ("ngram", "ngram_gpu"):
+             # Set default values if not provided
+             if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
+                 # TODO(woosuk): Tune these values. They are arbitrarily chosen.
+@@ -885,7 +901,8 @@ class SpeculativeConfig:
+         method = self.method
+         model = (
+             None
+-            if method in ("ngram", "suffix", "extract_hidden_states")
++            if method
++            in ("ngram", "token_recycling", "suffix", "extract_hidden_states")
+             else self.draft_model_config.model
+         )
+         num_spec_tokens = self.num_speculative_tokens
+diff --git a/vllm/v1/spec_decode/token_recycling_proposer.py b/vllm/v1/spec_decode/token_recycling_proposer.py
+new file mode 100644
+index 0000000..5b2f40f
+--- /dev/null
++++ b/vllm/v1/spec_decode/token_recycling_proposer.py
+@@ -0,0 +1,126 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Train-free speculative drafting from a per-request adjacency matrix (Token Recycling).
++
++This implements the *matrix + online top-k update* core of arXiv:2408.08696 and uses
++vLLM's standard chain speculative verification (same path as ngram), not the paper's
++BFS draft tree + custom tree attention (which would require the EAGLE tree backend).
++"""
++
++from __future__ import annotations
++
++import os
++import numpy as np
++import torch
++
++from vllm.config import VllmConfig
++
++
++def _valid_candidates(row: np.ndarray, k_take: int) -> list[int]:
++    """Skip non-positive entries (0 = no candidate in paper-style matrices)."""
++    out: list[int] = []
++    for x in row.tolist():
++        if len(out) >= k_take:
++            break
++        if x <= 0:
++            continue
++        out.append(int(x))
++    return out
++
++
++class TokenRecyclingProposer:
++    def __init__(self, vllm_config: VllmConfig):
++        assert vllm_config.speculative_config is not None
++        spec = vllm_config.speculative_config
++        self.k = spec.token_recycling_k
++        self.num_spec_tokens = spec.num_speculative_tokens
++        assert self.num_spec_tokens is not None
++        tc = vllm_config.model_config.hf_text_config
++        self.vocab_size = int(tc.vocab_size)
++        self.max_model_len = vllm_config.model_config.max_model_len
++        # req_id -> int32 (vocab, k) on CPU
++        self._matrices: dict[str, torch.Tensor] = {}
++        path = spec.token_recycling_matrix_path
++        if path:
++            if not os.path.isfile(path):
++                raise FileNotFoundError(
++                    f"token_recycling_matrix_path={path!r} does not exist"
++                )
++            shared = torch.load(path, map_location="cpu", weights_only=False)
++            if tuple(shared.shape) != (self.vocab_size, self.k):
++                raise ValueError(
++                    f"Expected matrix {(self.vocab_size, self.k)}, got {tuple(shared.shape)}"
++                )
++            self._shared_bootstrap = shared.to(dtype=torch.int32)
++        else:
++            self._shared_bootstrap = None
++
++    def _ensure_matrix(self, req_id: str) -> torch.Tensor:
++        m = self._matrices.get(req_id)
++        if m is None:
++            if self._shared_bootstrap is not None:
++                m = self._shared_bootstrap.clone()
++            else:
++                m = torch.zeros((self.vocab_size, self.k), dtype=torch.int32)
++            self._matrices[req_id] = m
++        return m
++
++    def free_request(self, req_id: str) -> None:
++        self._matrices.pop(req_id, None)
++
++    def update_rows_gpu(
++        self,
++        parent_token_ids: torch.Tensor,
++        req_indices: torch.Tensor,
++        topk_indices: torch.Tensor,
++        req_ids: list[str],
++    ) -> None:
++        """Scatter top-k rows into CPU matrices (caller provides GPU top-k)."""
++        parent_token_ids_cpu = parent_token_ids.cpu()
++        req_indices_cpu = req_indices.cpu()
++        topk_cpu = topk_indices.cpu()
++        for i in range(parent_token_ids_cpu.shape[0]):
++            rid = req_ids[int(req_indices_cpu[i].item())]
++            tid = int(parent_token_ids_cpu[i].item())
++            if not (0 <= tid < self.vocab_size):
++                continue
++            m = self._ensure_matrix(rid)
++            m[tid] = topk_cpu[i].to(dtype=torch.int32)
++
++    def propose(
++        self,
++        sampled_token_ids: list[list[int]],
++        num_tokens_no_spec: np.ndarray,
++        token_ids_cpu: np.ndarray,
++        req_ids: list[str],
++        slot_mappings: dict[str, torch.Tensor]
++        | list[dict[str, torch.Tensor]]
++        | None = None,
++    ) -> list[list[int]]:
++        del slot_mappings
++        draft_token_ids: list[list[int]] = []
++        for i, sampled_ids in enumerate(sampled_token_ids):
++            if not sampled_ids:
++                draft_token_ids.append([])
++                continue
++            num_tokens = int(num_tokens_no_spec[i])
++            if num_tokens >= self.max_model_len:
++                draft_token_ids.append([])
++                continue
++            row = token_ids_cpu[i]
++            last_tok = int(row[num_tokens - 1])
++            if not (0 <= last_tok < self.vocab_size):
++                draft_token_ids.append([])
++                continue
++            m = self._ensure_matrix(req_ids[i]).numpy()
++            chain: list[int] = []
++            cur = last_tok
++            for _ in range(self.num_spec_tokens):
++                cand = _valid_candidates(m[cur], self.k)
++                if not cand:
++                    break
++                nxt = cand[0]
++                chain.append(nxt)
++                cur = nxt
++            draft_token_ids.append(chain)
++        return draft_token_ids
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 7a21117..1e66829 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -378,6 +378,7 @@ class ExecuteModelState(NamedTuple):
+ 
+     scheduler_output: "SchedulerOutput"
+     logits: torch.Tensor
++    logits_indices: torch.Tensor
+     spec_decode_metadata: SpecDecodeMetadata | None
+     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
+     hidden_states: torch.Tensor
+@@ -526,6 +527,12 @@ class GPUModelRunner(
+                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+ 
+                 self.drafter = NgramProposer(self.vllm_config)
++            elif self.speculative_config.method == "token_recycling":
++                from vllm.v1.spec_decode.token_recycling_proposer import (
++                    TokenRecyclingProposer,
++                )
++
++                self.drafter = TokenRecyclingProposer(self.vllm_config)
+             elif self.speculative_config.uses_draft_model():
+                 self.drafter = DraftModelProposer(
+                     vllm_config=self.vllm_config,
+@@ -1060,6 +1067,17 @@ class GPUModelRunner(
+         for req_id in scheduler_output.finished_req_ids:
+             self.requests.pop(req_id, None)
+             self.num_prompt_logprobs.pop(req_id, None)
++            if (
++                self.speculative_config is not None
++                and self.speculative_config.method == "token_recycling"
++                and getattr(self, "drafter", None) is not None
++            ):
++                from vllm.v1.spec_decode.token_recycling_proposer import (
++                    TokenRecyclingProposer,
++                )
++
++                if isinstance(self.drafter, TokenRecyclingProposer):
++                    self.drafter.free_request(req_id)
+         self.late_interaction_runner.on_requests_finished(
+             scheduler_output.finished_req_ids
+         )
+@@ -2654,6 +2672,40 @@ class GPUModelRunner(
+             logits_indices=logits_indices,
+         )
+ 
++    def _update_token_recycling_matrices(
++        self,
++        logits: torch.Tensor,
++        logits_indices: torch.Tensor,
++    ) -> None:
++        spec = self.speculative_config
++        if spec is None or spec.method != "token_recycling":
++            return
++        from vllm.v1.spec_decode.token_recycling_proposer import TokenRecyclingProposer
++
++        if not isinstance(self.drafter, TokenRecyclingProposer):
++            return
++        num_logits = logits.shape[0]
++        if num_logits == 0:
++            return
++        li = logits_indices[:num_logits]
++        input_ids_gpu = self.input_ids.gpu
++        parent_ids = input_ids_gpu[li]
++        req_per_tok = self.req_indices.gpu[li]
++        num_reqs = self.input_batch.num_reqs
++        discard_gpu = self.discard_request_mask.gpu[:num_reqs].bool()
++        keep = ~discard_gpu[req_per_tok.long()]
++        if not keep.any():
++            return
++        k = spec.token_recycling_k
++        logits_kept = logits[:num_logits][keep]
++        _, topk = torch.topk(logits_kept.float(), k=k, dim=-1)
++        self.drafter.update_rows_gpu(
++            parent_ids[keep],
++            req_per_tok[keep],
++            topk,
++            self.input_batch.req_ids,
++        )
++
+     def _prepare_kv_sharing_fast_prefill(
+         self,
+         logits_indices: torch.Tensor,
+@@ -4090,6 +4142,7 @@ class GPUModelRunner(
+         self.execute_model_state = ExecuteModelState(
+             scheduler_output,
+             logits,
++            logits_indices,
+             spec_decode_metadata,
+             spec_decode_common_attn_metadata,
+             hidden_states,
+@@ -4134,6 +4187,7 @@ class GPUModelRunner(
+         (
+             scheduler_output,
+             logits,
++            logits_indices,
+             spec_decode_metadata,
+             spec_decode_common_attn_metadata,
+             hidden_states,
+@@ -4152,6 +4206,11 @@ class GPUModelRunner(
+                 scheduler_output, grammar_output, self.input_batch, logits
+             )
+ 
++        self._update_token_recycling_matrices(
++            logits=logits,
++            logits_indices=logits_indices,
++        )
++
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
+ 
+@@ -4497,6 +4556,20 @@ class GPUModelRunner(
+                 self.input_batch.token_ids_cpu,
+                 slot_mappings=slot_mappings,
+             )
++        elif spec_config.method == "token_recycling":
++            from vllm.v1.spec_decode.token_recycling_proposer import (
++                TokenRecyclingProposer,
++            )
++
++            assert isinstance(sampled_token_ids, list)
++            assert isinstance(self.drafter, TokenRecyclingProposer)
++            draft_token_ids = self.drafter.propose(
++                sampled_token_ids,
++                self.input_batch.num_tokens_no_spec,
++                self.input_batch.token_ids_cpu,
++                self.input_batch.req_ids,
++                slot_mappings=slot_mappings,
++            )
+         elif spec_config.use_ngram_gpu():
+             assert isinstance(self.drafter, NgramProposerGPU)
+             (
